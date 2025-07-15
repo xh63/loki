@@ -24,37 +24,10 @@ import (
 	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
-const (
-	labelNameStart = "__start__"
-	labelNameEnd   = "__end__"
-	labelNamePath  = "__path__"
-)
-
-// StorageFormatType is the dataobj section type used to store the metastore top-level index oblects.
-type StorageFormatType int
-
-const (
-	// StorageFormatTypeV1 is the old top-level streams based object format.
-	StorageFormatTypeV1 StorageFormatType = iota
-	// StorageFormatTypeV2 is the new top-level index pointer based object format.
-	StorageFormatTypeV2
-)
-
-// Define our own builder config because metastore objects are significantly smaller.
-var metastoreBuilderCfg = logsobj.BuilderConfig{
-	TargetObjectSize:  32 * 1024 * 1024,
-	TargetPageSize:    4 * 1024 * 1024,
-	BufferSize:        32 * 1024 * 1024, // 8x page size
-	TargetSectionSize: 4 * 1024 * 1024,  // object size / 8
-
-	SectionStripeMergeLimit: 2,
-}
-
-type Updater struct {
+type MultiTenantUpdater struct {
 	cfg              UpdaterConfig
 	builder          *indexobj.Builder // New index pointer based builder.
 	metastoreBuilder *logsobj.Builder  // Deprecated streams based builder.
-	tenantID         string
 	metrics          *metastoreMetrics
 	bucket           objstore.Bucket
 	logger           log.Logger
@@ -64,15 +37,14 @@ type Updater struct {
 	builderOnce sync.Once
 }
 
-func NewUpdater(cfg UpdaterConfig, bucket objstore.Bucket, tenantID string, logger log.Logger) *Updater {
+func NewMultiTenantUpdater(cfg UpdaterConfig, bucket objstore.Bucket, logger log.Logger) *MultiTenantUpdater {
 	metrics := newMetastoreMetrics()
 
-	return &Updater{
+	return &MultiTenantUpdater{
 		cfg:      cfg,
 		bucket:   bucket,
 		metrics:  metrics,
 		logger:   logger,
-		tenantID: tenantID,
 		backoff: backoff.New(context.TODO(), backoff.Config{
 			MinBackoff: 50 * time.Millisecond,
 			MaxBackoff: 10 * time.Second,
@@ -81,15 +53,15 @@ func NewUpdater(cfg UpdaterConfig, bucket objstore.Bucket, tenantID string, logg
 	}
 }
 
-func (m *Updater) RegisterMetrics(reg prometheus.Registerer) error {
+func (m *MultiTenantUpdater) RegisterMetrics(reg prometheus.Registerer) error {
 	return m.metrics.register(reg)
 }
 
-func (m *Updater) UnregisterMetrics(reg prometheus.Registerer) {
+func (m *MultiTenantUpdater) UnregisterMetrics(reg prometheus.Registerer) {
 	m.metrics.unregister(reg)
 }
 
-func (m *Updater) initBuilder() error {
+func (m *MultiTenantUpdater) initBuilder() error {
 	var initErr error
 	m.builderOnce.Do(func() {
 		metastoreBuilder, err := logsobj.NewBuilder(metastoreBuilderCfg)
@@ -117,7 +89,7 @@ func (m *Updater) initBuilder() error {
 }
 
 // Update adds provided dataobj path to the metastore. Flush stats are used to determine the stored metadata about this dataobj.
-func (m *Updater) Update(ctx context.Context, dataobjPath string, minTimestamp, maxTimestamp time.Time) error {
+func (m *MultiTenantUpdater) Update(ctx context.Context, tenantIDs []string, dataobjPath string, minTimestamp, maxTimestamp time.Time) error {
 	var err error
 	processingTime := prometheus.NewTimer(m.metrics.metastoreProcessingTime)
 	defer processingTime.ObserveDuration()
@@ -129,7 +101,7 @@ func (m *Updater) Update(ctx context.Context, dataobjPath string, minTimestamp, 
 
 	// Work our way through the metastore objects window by window, updating & creating them as needed.
 	// Each one handles its own retries in order to keep making progress in the event of a failure.
-	for metastorePath := range iterStorePaths(m.tenantID, minTimestamp, maxTimestamp) {
+	for metastorePath := range multiTenantIterStorePaths(minTimestamp, maxTimestamp) {
 		m.backoff.Reset()
 		for m.backoff.Ongoing() {
 			err = m.bucket.GetAndReplace(ctx, metastorePath, func(existing io.Reader) (io.Reader, error) {
@@ -162,7 +134,7 @@ func (m *Updater) Update(ctx context.Context, dataobjPath string, minTimestamp, 
 				}
 
 				encodingDuration := prometheus.NewTimer(m.metrics.metastoreEncodingTime)
-				err = m.append(ty, dataobjPath, minTimestamp, maxTimestamp)
+				err = m.append(ty, tenantID, dataobjPath, minTimestamp, maxTimestamp)
 				if err != nil {
 					return nil, errors.Wrap(err, "appending to metastore builder")
 				}
@@ -202,7 +174,7 @@ func (m *Updater) Update(ctx context.Context, dataobjPath string, minTimestamp, 
 	return err
 }
 
-func (m *Updater) append(ty StorageFormatType, dataobjPath string, minTimestamp, maxTimestamp time.Time) error {
+func (m *MultiTenantUpdater) append(ty StorageFormatType, tenantIDs []string, dataobjPath string, minTimestamp, maxTimestamp time.Time) error {
 	switch ty {
 	// Backwards compatibility with old metastore top-level objects.
 	case StorageFormatTypeV1:
@@ -212,7 +184,7 @@ func (m *Updater) append(ty StorageFormatType, dataobjPath string, minTimestamp,
 			labels.Label{Name: labelNamePath, Value: dataobjPath},
 		)
 
-		err := m.metastoreBuilder.Append(m.tenantID, logproto.Stream{
+		err := m.metastoreBuilder.Append(tenantID, logproto.Stream{
 			Labels:  ls.String(),
 			Entries: []logproto.Entry{{Line: ""}},
 		})
@@ -233,7 +205,7 @@ func (m *Updater) append(ty StorageFormatType, dataobjPath string, minTimestamp,
 }
 
 // readFromExisting reads the provided metastore object and appends the streams to the builder so it can be later modified.
-func (m *Updater) readFromExisting(ctx context.Context, object *dataobj.Object) (StorageFormatType, error) {
+func (m *MultiTenantUpdater) readFromExisting(ctx context.Context, object *dataobj.Object) (StorageFormatType, error) {
 	var streamsReader streams.RowReader
 	defer streamsReader.Close()
 
@@ -263,7 +235,7 @@ func (m *Updater) readFromExisting(ctx context.Context, object *dataobj.Object) 
 					return StorageFormatTypeV1, errors.Wrap(err, "reading streams")
 				}
 				for _, stream := range buf[:n] {
-					err = m.metastoreBuilder.Append(m.tenantID, logproto.Stream{
+					err = m.metastoreBuilder.Append(tenantID, logproto.Stream{
 						Labels:  stream.Labels.String(),
 						Entries: []logproto.Entry{{Line: ""}},
 					})

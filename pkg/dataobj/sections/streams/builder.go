@@ -57,6 +57,7 @@ var streamPool = sync.Pool{
 
 // Builder builds a streams section.
 type Builder struct {
+	tenant   string
 	metrics  *Metrics
 	pageSize int
 	lastID   atomic.Int64
@@ -76,11 +77,12 @@ type Builder struct {
 
 // NewBuilder creates a new sterams section builder. The pageSize argument
 // specifies how large pages should be.
-func NewBuilder(metrics *Metrics, pageSize int) *Builder {
+func NewBuilder(tenant string, metrics *Metrics, pageSize int) *Builder {
 	if metrics == nil {
 		metrics = NewMetrics()
 	}
 	return &Builder{
+		tenant:   tenant,
 		metrics:  metrics,
 		pageSize: pageSize,
 		lookup:   make(map[uint64][]*Stream, 1024),

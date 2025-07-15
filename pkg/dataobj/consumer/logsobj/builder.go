@@ -121,8 +121,8 @@ type Builder struct {
 	currentSizeEstimate int
 
 	builder *dataobj.Builder // Inner builder for accumulating sections.
-	streams *streams.Builder
-	logs    *logs.Builder
+	streams map[string]*streams.Builder // The key is the TenantID.
+	logs    map[string]*logs.Builder // The key is the TenantID.
 
 	state builderState
 }
@@ -160,12 +160,8 @@ func NewBuilder(cfg BuilderConfig) (*Builder, error) {
 		labelCache: labelCache,
 
 		builder: dataobj.NewBuilder(),
-		streams: streams.NewBuilder(metrics.streams, int(cfg.TargetPageSize)),
-		logs: logs.NewBuilder(metrics.logs, logs.BuilderOptions{
-			PageSizeHint:     int(cfg.TargetPageSize),
-			BufferSize:       int(cfg.BufferSize),
-			StripeMergeLimit: cfg.SectionStripeMergeLimit,
-		}),
+		streams: make(map[string]*streams.Builder),
+		logs:    make(map[string]*logs.Builder),
 	}, nil
 }
 
@@ -179,7 +175,7 @@ func (b *Builder) GetEstimatedSize() int {
 //
 // Once a Builder is full, call [Builder.Flush] to flush the buffered data,
 // then call Append again with the same entry.
-func (b *Builder) Append(stream logproto.Stream) error {
+func (b *Builder) Append(tenantID string, stream logproto.Stream) error {
 	ls, err := b.parseLabels(stream.Labels)
 	if err != nil {
 		return err
@@ -195,6 +191,22 @@ func (b *Builder) Append(stream logproto.Stream) error {
 		return ErrBuilderFull
 	}
 
+	tenantStreams, ok := b.streams[tenantID]
+	if !ok {
+		tenantStreams = streams.NewBuilder(tenantID, b.metrics.streams, int(b.cfg.TargetPageSize))
+		b.streams[tenantID] = tenantStreams
+	}
+
+	tenantLogs, ok := b.logs[tenantID]
+	if !ok {
+		tenantLogs = logs.NewBuilder(tenantID, b.metrics.logs, logs.BuilderOptions{
+			PageSizeHint:     int(b.cfg.TargetPageSize),
+			BufferSize:       int(b.cfg.BufferSize),
+			StripeMergeLimit: b.cfg.SectionStripeMergeLimit,
+		})
+		b.logs[tenantID] = tenantLogs
+	}
+
 	timer := prometheus.NewTimer(b.metrics.appendTime)
 	defer timer.ObserveDuration()
 
@@ -204,9 +216,9 @@ func (b *Builder) Append(stream logproto.Stream) error {
 			sz += int64(len(md.Value))
 		}
 
-		streamID := b.streams.Record(ls, entry.Timestamp, sz)
+		streamID := tenantStreams.Record(ls, entry.Timestamp, sz)
 
-		b.logs.Append(logs.Record{
+		tenantLogs.Append(logs.Record{
 			StreamID:  streamID,
 			Timestamp: entry.Timestamp,
 			Metadata:  convertMetadata(entry.StructuredMetadata),
@@ -215,8 +227,8 @@ func (b *Builder) Append(stream logproto.Stream) error {
 
 		// If our logs section has gotten big enough, we want to flush it to the
 		// encoder and start a new section.
-		if b.logs.UncompressedSize() > int(b.cfg.TargetSectionSize) {
-			if err := b.builder.Append(b.logs); err != nil {
+		if tenantLogs.UncompressedSize() > int(b.cfg.TargetSectionSize) {
+			if err := b.builder.Append(tenantLogs); err != nil {
 				return err
 			}
 		}
@@ -286,8 +298,12 @@ func convertMetadata(md push.LabelsAdapter) labels.Labels {
 
 func (b *Builder) estimatedSize() int {
 	var size int
-	size += b.streams.EstimatedSize()
-	size += b.logs.EstimatedSize()
+	for _, tenantStreams := range b.streams {
+		size += tenantStreams.EstimatedSize()
+	}
+	for _, tenantLogs := range b.logs {
+		size += tenantLogs.EstimatedSize()
+	}
 	size += b.builder.Bytes()
 	b.metrics.sizeEstimate.Set(float64(size))
 	return size
@@ -296,6 +312,7 @@ func (b *Builder) estimatedSize() int {
 type FlushStats struct {
 	MinTimestamp time.Time
 	MaxTimestamp time.Time
+	TenantIDs    []string
 }
 
 // Flush flushes all buffered data to the buffer provided. Calling Flush can result
@@ -312,13 +329,35 @@ func (b *Builder) Flush(output *bytes.Buffer) (FlushStats, error) {
 
 	// Appending sections resets them, so we need to load the time range before
 	// appending.
-	minTime, maxTime := b.streams.TimeRange()
+	var minTime, maxTime time.Time
+	for _, ts := range b.streams {
+		tMinTime, tMaxTime := ts.TimeRange()
+		if tMinTime.Before(minTime) {
+			minTime = tMinTime
+		}
+		if tMaxTime.After(maxTime) {
+			maxTime = tMaxTime
+		}
+	}
 
 	// Flush sections one more time in case they have data.
 	var flushErrors []error
+	var tenantIDs []string
 
-	flushErrors = append(flushErrors, b.builder.Append(b.streams))
-	flushErrors = append(flushErrors, b.builder.Append(b.logs))
+	for tenant := range b.streams {
+		if err := b.builder.Append(b.streams[tenant]); err != nil {
+			flushErrors = append(flushErrors, err)
+			continue
+		}
+
+		if tenantLogs, ok := b.logs[tenant]; ok {
+			if err := b.builder.Append(tenantLogs); err != nil {
+				flushErrors = append(flushErrors, err)
+				continue
+			}
+		}
+		tenantIDs = append(tenantIDs, tenant)
+	}
 
 	if err := errors.Join(flushErrors...); err != nil {
 		b.metrics.flushFailures.Inc()
@@ -349,7 +388,7 @@ func (b *Builder) Flush(output *bytes.Buffer) (FlushStats, error) {
 	err = b.observeObject(context.Background(), obj)
 
 	b.Reset()
-	return FlushStats{MinTimestamp: minTime, MaxTimestamp: maxTime}, err
+	return FlushStats{TenantIDs: tenantIDs, MinTimestamp: minTime, MaxTimestamp: maxTime}, err
 }
 
 func (b *Builder) observeObject(ctx context.Context, obj *dataobj.Object) error {
@@ -383,8 +422,10 @@ func (b *Builder) observeObject(ctx context.Context, obj *dataobj.Object) error 
 // Reset discards pending data and resets the builder to an empty state.
 func (b *Builder) Reset() {
 	b.builder.Reset()
-	b.logs.Reset()
-	b.streams.Reset()
+	// TODO(grobinson): Return these to a pool. For now, just allow them to
+	// be GC'd and we will create new ones.
+	b.logs = make(map[string]*logs.Builder)
+	b.streams = make(map[string]*streams.Builder)
 
 	b.metrics.sizeEstimate.Set(0)
 	b.currentSizeEstimate = 0
