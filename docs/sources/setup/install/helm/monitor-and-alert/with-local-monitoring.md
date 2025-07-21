@@ -77,6 +77,8 @@ kubectl create secret generic minio -n meta \
 ```
 {{< admonition type="note" >}}
 Username and password must have a minimum of 8 characters.
+<INSERT USERNAME OF CHOICE> in MINIO_ROOT_USER=yourchoiceofusername
+<INSERT PASSWORD OF CHOICE> in MINIO_ROOT_PASSWORD=yourchoiceofpassword
 {{< /admonition >}}
 
 To install the meta-monitoring stack, run the following commands:
